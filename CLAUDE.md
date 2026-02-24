@@ -17,6 +17,9 @@ python jira_ticket_creator.py
 
 # Specify a data file explicitly
 python jira_ticket_creator.py --file "path/to/report.xlsx"
+
+# Send a Google Chat card to THE GOAT space (requires GOOGLE_CHAT_WEBHOOK in .env)
+python jira_ticket_creator.py --report
 ```
 
 ## Environment Setup
@@ -25,6 +28,7 @@ Create a `.env` file in the project root:
 
 ```
 JIRA_API_TOKEN=your_token_here
+GOOGLE_CHAT_WEBHOOK=https://chat.googleapis.com/v1/spaces/.../messages?key=...  # required for --report
 ```
 
 No virtual environment is required. Install dependencies with:

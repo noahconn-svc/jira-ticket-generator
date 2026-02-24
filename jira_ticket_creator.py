@@ -21,6 +21,7 @@ load_dotenv()
 JIRA_URL = "https://conservice.atlassian.net"
 JIRA_EMAIL = "nconn@conservice.com"
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+GOOGLE_CHAT_WEBHOOK = os.getenv("GOOGLE_CHAT_WEBHOOK")
 PROJECT_KEY = "DIT"
 
 # Column names (matching the Power BI export exactly)
@@ -729,10 +730,94 @@ def _run_table_test():
 # ── END TEMPORARY TEST SCAFFOLDING ───────────────────────────────────────────
 
 
+def send_google_chat_report(providers_df):
+    """POST a Google Chat Card v2 with flagged providers to THE GOAT space."""
+    if not GOOGLE_CHAT_WEBHOOK:
+        print("\nERROR: GOOGLE_CHAT_WEBHOOK not set in .env")
+        print("Add: GOOGLE_CHAT_WEBHOOK=https://chat.googleapis.com/v1/spaces/.../messages?key=...")
+        sys.exit(1)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    n = len(providers_df)
+    has_metadata = "_has_open_dc" in providers_df.columns
+
+    sections = []
+    for _, row in providers_df.iterrows():
+        name = str(row[COL_PROVIDER_NAME])
+        pid = int(row[COL_PROVIDER_ID])
+        pct = row[COL_PERCENT_INGESTED]
+        variance = row[COL_VARIANCE]
+        avg = row[COL_ROLLING_AVG_LOCATIONS]
+
+        widgets = [
+            {"decoratedText": {"topLabel": "% Ingested MTD", "text": f"{pct:.1%}"}},
+            {"decoratedText": {"topLabel": "Variance vs 3-Mo Avg", "text": f"{variance:,.0f}"}},
+            {"decoratedText": {"topLabel": "Rolling 3-Mo Avg Locations", "text": f"{avg:,.0f}"}},
+        ]
+
+        if has_metadata:
+            status_text = str(row.get("_dc_status_display", "") or "")
+            related_items = row.get("_related_items", []) or []
+            if related_items:
+                for item in related_items:
+                    key = item["key"]
+                    url = item["url"]
+                    label_text = f"{key} · {status_text}" if status_text else key
+                    widgets.append({
+                        "decoratedText": {
+                            "topLabel": "Jira",
+                            "text": label_text,
+                            "button": {
+                                "text": key,
+                                "onClick": {"openLink": {"url": url}},
+                            },
+                        }
+                    })
+            elif status_text:
+                widgets.append({"decoratedText": {"topLabel": "Jira", "text": status_text}})
+
+        sections.append({
+            "header": f"{name} ({pid})",
+            "collapsible": True,
+            "uncollapsibleWidgetsCount": 1,
+            "widgets": widgets,
+        })
+
+    payload = {
+        "cardsV2": [{
+            "cardId": "variance-report",
+            "card": {
+                "header": {
+                    "title": "⚠️ Power BI Variance Report",
+                    "subtitle": f"{today} · {n} provider{'s' if n != 1 else ''} flagged",
+                    "imageType": "CIRCLE",
+                    "imageUrl": "https://fonts.gstatic.com/s/i/googlematerialicons/warning/v6/white-48dp.png",
+                },
+                "sections": sections,
+            },
+        }]
+    }
+
+    resp = requests.post(GOOGLE_CHAT_WEBHOOK, json=payload)
+    if resp.status_code == 200:
+        print(f"\nReport sent. ({n} provider{'s' if n != 1 else ''} flagged)")
+    else:
+        print(f"\nERROR: Failed to send report. Status {resp.status_code}: {resp.text[:300]}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Create Jira tickets from Power BI variance data")
     parser.add_argument("--dry-run", action="store_true", help="Preview tickets without creating them")
     parser.add_argument("--file", type=str, help="Path to Power BI export file (auto-detected if omitted)")
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help=(
+            "Send a Google Chat card with flagged providers to THE GOAT space, then exit. "
+            "Requires GOOGLE_CHAT_WEBHOOK in .env. JIRA_API_TOKEN is optional but recommended "
+            "for ticket status enrichment."
+        ),
+    )
     parser.add_argument(
         "--test",
         action="store_true",
@@ -755,8 +840,8 @@ def main():
 
     prompt_thresholds()
 
-    # Check for API token (skip in dry-run)
-    if not args.dry_run and not JIRA_API_TOKEN:
+    # Check for API token (skip in dry-run and report modes)
+    if not args.dry_run and not args.report and not JIRA_API_TOKEN:
         print("\nERROR: JIRA_API_TOKEN not found in environment variables")
         print("Create a .env file with: JIRA_API_TOKEN=your_token_here")
         sys.exit(1)
@@ -810,6 +895,10 @@ def main():
         print(f"  {n_open_dc} with existing open stories, {len(problematic) - n_open_dc} new tickets needed")
     else:
         print("\n  (Skipping duplicate check -- no API token)")
+
+    if args.report:
+        send_google_chat_report(problematic)
+        return
 
     # Provider selection UI (also enforces MAX_TICKETS_PER_RUN cap)
     problematic = select_providers(problematic)
