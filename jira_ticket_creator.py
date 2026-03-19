@@ -46,15 +46,6 @@ _CONFIG_PATH = os.path.join(_SCRIPT_DIR, "config.json")
 _RUNS_PATH = os.path.join(_SCRIPT_DIR, "runs.jsonl")
 _LOG_PATH = os.path.join(_SCRIPT_DIR, "jira_ticket_creator.log")
 
-STATUS_DISPLAY_MAP = {
-    "Backlog":                "To Do",
-    "To Do":                  "To Do",
-    "In Progress":            "Development",
-    "Code Review & Security": "Testing",
-    "Testing":                "Peer Review",
-    "Merge":                  "Ops Review",
-}
-
 # Logging — file only; no console output
 logging.basicConfig(
     filename=_LOG_PATH,
@@ -126,16 +117,10 @@ def get_jira_auth():
 
 
 def check_related_tickets(provider_name, provider_id, dc_lookback_days):
-    """Check for existing and related tickets for this provider.
+    """Check for existing DC tickets for this provider.
 
     Returns:
-        {
-            "has_open_dc": bool,
-            "dc_ticket": str | None,
-            "dc_status_display": str,
-            "dc_status_category": str,
-            "related": [{"key": ..., "summary": ..., "url": ...}]
-        }
+        {"has_open_dc": bool, "has_recent_dc": bool}
     """
     auth, headers = get_jira_auth()
     pid = int(provider_id)
@@ -160,19 +145,8 @@ def check_related_tickets(provider_name, provider_id, dc_lookback_days):
         f'AND (summary ~ "{pid}" OR summary ~ "{provider_name}") '
         f'AND statusCategory != Done'
     )
-    dc_issues = run_jql(jql_dc, 1)
-    if dc_issues:
-        issue = dc_issues[0]
-        status_name = STATUS_DISPLAY_MAP.get(
-            issue["fields"]["status"]["name"], issue["fields"]["status"]["name"]
-        )
-        return {
-            "has_open_dc": True,
-            "dc_ticket": issue["key"],
-            "dc_status_display": status_name,
-            "dc_status_category": issue["fields"]["status"]["statusCategory"]["name"],
-            "related": [],
-        }
+    if run_jql(jql_dc, 1):
+        return {"has_open_dc": True, "has_recent_dc": False}
 
     # Query 1b: recently completed Data Completeness ticket
     jql_dc_done = (
@@ -181,54 +155,8 @@ def check_related_tickets(provider_name, provider_id, dc_lookback_days):
         f'AND (summary ~ "{pid}" OR summary ~ "{provider_name}") '
         f'AND statusCategory = Done AND updated >= -{dc_lookback_days}d'
     )
-    dc_ticket = dc_status_display = dc_status_category = ""
     dc_done_issues = run_jql(jql_dc_done, 1)
-    if dc_done_issues:
-        issue = dc_done_issues[0]
-        dc_ticket = issue["key"]
-        resdate = issue["fields"].get("resolutiondate") or ""
-        dc_status_display = f"Completed {resdate[5:7]}/{resdate[8:10]}" if resdate else "Completed"
-        dc_status_category = "Done"
-
-    related = []
-
-    # Query 2: other open tickets mentioning this provider (not Data Completeness)
-    jql_open = (
-        f'project = {PROJECT_KEY} '
-        f'AND NOT summary ~ "Data Completeness" '
-        f'AND (summary ~ "{pid}" OR summary ~ "{provider_name}") '
-        f'AND statusCategory != Done'
-    )
-    for issue in run_jql(jql_open, 5):
-        related.append({
-            "key": issue["key"],
-            "summary": issue["fields"]["summary"],
-            "url": f"{JIRA_URL}/browse/{issue['key']}",
-        })
-
-    # Query 3: recently completed non-DC tickets mentioning this provider
-    jql_done = (
-        f'project = {PROJECT_KEY} '
-        f'AND NOT summary ~ "Data Completeness" '
-        f'AND (summary ~ "{pid}" OR summary ~ "{provider_name}") '
-        f'AND statusCategory = Done '
-        f'AND updated >= -{dc_lookback_days}d'
-    )
-    for issue in run_jql(jql_done, 5):
-        if not any(r["key"] == issue["key"] for r in related):
-            related.append({
-                "key": issue["key"],
-                "summary": issue["fields"]["summary"],
-                "url": f"{JIRA_URL}/browse/{issue['key']}",
-            })
-
-    return {
-        "has_open_dc": False,
-        "dc_ticket": dc_ticket,
-        "dc_status_display": dc_status_display,
-        "dc_status_category": dc_status_category,
-        "related": related,
-    }
+    return {"has_open_dc": False, "has_recent_dc": bool(dc_done_issues)}
 
 
 def build_description(provider_name, provider_id):
@@ -514,25 +442,14 @@ def run(file_path=None):
     for _, row in flagged.iterrows():
         result = check_related_tickets(row[COL_PROVIDER_NAME], row[COL_PROVIDER_ID], dc_lookback_days)
         row = row.copy()
-        row["_has_open_dc"]       = result["has_open_dc"]
-        row["_dc_ticket"]         = result["dc_ticket"]
-        row["_dc_status_display"] = result["dc_status_display"]
-        row["_dc_status_cat"]     = result["dc_status_category"]
-        related_items = []
-        if result["dc_ticket"]:
-            related_items.append({"key": result["dc_ticket"], "url": f"{JIRA_URL}/browse/{result['dc_ticket']}"})
-        related_items += [{"key": r["key"], "url": r["url"]} for r in result["related"]]
-        row["_related_items"] = related_items
+        row["_has_open_dc"]   = result["has_open_dc"]
+        row["_has_recent_dc"] = result["has_recent_dc"]
         enriched.append(row)
     flagged = pd.DataFrame(enriched)
 
     # Auto-select: skip providers with open DC or recently completed DC story
     def is_eligible(row):
-        if row.get("_has_open_dc", False):
-            return False
-        if str(row.get("_dc_status_display", "")).startswith("Completed"):
-            return False
-        return True
+        return not row.get("_has_open_dc", False) and not row.get("_has_recent_dc", False)
 
     eligible = flagged[flagged.apply(is_eligible, axis=1)].head(max_tickets_per_run)
     skipped = len(flagged) - len(eligible)
