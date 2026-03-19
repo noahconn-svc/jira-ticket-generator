@@ -3,5 +3,5 @@
   "max_variance": -1000,
   "max_tickets_per_run": 1,
   "dc_lookback_days": 30,
-  "send_google_chat_report": true
+  "send_google_chat_report": false
 }
