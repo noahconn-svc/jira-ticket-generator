@@ -1,1 +1,0 @@
-{"timestamp": "2026-03-19T11:06:35", "file": "Variance in Bills and Locations Ingested by Bill Central.xlsx", "thresholds": {"min_percent_ingested": 0.1, "max_variance": -1000, "max_tickets_per_run": 1, "dc_lookback_days": 30}, "providers_evaluated": 8603, "providers_flagged": 11, "tickets_created": ["DIT-6976"], "tickets_skipped": 10, "errors": []}
