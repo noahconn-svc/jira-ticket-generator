@@ -1,20 +1,16 @@
-# CLAUDE.md — Jira Ticket Generator
+# CLAUDE.md — Jira Ticket Generator (RFC 67) / Shepherd
 
 ## Project Overview
 
-A Python automation script that reads a Power BI variance report (Excel/CSV) and creates Jira Stories in the `DIT` project at `conservice.atlassian.net` for utility bill data providers that are significantly underperforming their historical ingestion averages.
-
-This is a **proof of concept**. The current workflow is manual; future plans include scheduling/automation and support for additional data sources.
+A Python automation script that reads the daily Data Completeness variance report (CSV) and creates Jira Stories in the `ITDC` project at `conservice.atlassian.net` for utility bill data providers that are significantly underperforming their historical ingestion averages. On every run, all open backlog tickets are re-ranked by variance severity so the worst offenders always appear at the top.
 
 ## How to Run
 
 ```bash
-# Automated run (scheduled/unattended — no prompts)
 python jira_ticket_creator.py
-
-# Management interface (configure thresholds, manual trigger)
-python manage.py
 ```
+
+Designed for unattended/scheduled execution — no interactive prompts.
 
 ## Environment Setup
 
@@ -22,10 +18,10 @@ Create a `.env` file in the project root:
 
 ```
 JIRA_API_TOKEN=your_token_here
-GOOGLE_CHAT_WEBHOOK=https://chat.googleapis.com/v1/spaces/.../messages?key=...  # required for --report
+GOOGLE_CHAT_WEBHOOK=https://chat.googleapis.com/v1/spaces/.../messages?key=...
 ```
 
-No virtual environment is required. Install dependencies with:
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -33,63 +29,99 @@ pip install -r requirements.txt
 
 ## Data File
 
-Drop the Power BI Excel export into the project directory. The script auto-detects any `.xlsx`, `.xls`, or `.csv` file with "variance" in the filename.
+The variance CSV is auto-updated each morning at 8:30 from Power BI at:
 
-Required columns (must match exactly):
-- `Abbyy Name`
-- `Abbyy/BC ID`
-- `% of Locactions Ingested MTD of Rolling 3 Month Avg`
-- `Current Month Expected Variance (Based on 3 Mos Avg)`
-- `Rolling 3 Month Avg # of Locations Ingested`
+```
+U:\Departments\Transformation\Ops Reporting Data\Data Completeness Report\Output\Variance in Bills and Locations Ingested by Bill Central.csv
+```
+
+Flexible column detection handles minor renames and the known `Locactions` → `Locations` typo. Required logical columns:
+
+- Provider name (`Abbyy Name`)
+- Provider ID (`Abbyy/BC ID`)
+- % of Locations Ingested MTD vs 3-Month Avg
+- Current Month Expected Variance (vs 3-Month Avg)
+- Rolling 3-Month Avg # of Locations Ingested
 
 ## Key Configuration
 
-Thresholds live in `config.json` (runtime state, gitignored). Edit via `manage.py` or directly. Falls back to hardcoded defaults if absent.
+All thresholds are hardcoded constants at the top of `jira_ticket_creator.py` — edit them there directly.
 
-| Key | Default | Meaning |
+| Constant | Default | Meaning |
 |---|---|---|
-| `min_percent_ingested` | `0.10` | Provider must have ingested ≥10% of locations MTD |
-| `max_variance` | `-1000` | Variance must be worse than -1,000 vs 3-month avg |
-| `max_tickets_per_run` | `2` | Hard cap on tickets created per execution |
-| `dc_lookback_days` | `30` | Days to look back for recently completed DC stories (skip window) |
-| `send_google_chat_report` | `false` | Send Google Chat card to THE GOAT space after each run |
+| `MIN_PERCENT_INGESTED` | `0.10` | Provider must have ingested ≥10% of locations MTD |
+| `MAX_VARIANCE` | `-1000` | Variance must be strictly worse than -1,000 vs 3-month avg |
+| `DC_LOOKBACK_DAYS` | `30` | Days after completion before a provider re-enters the backlog |
+| `SEND_GOOGLE_CHAT_REPORT` | `True` | Send Google Chat card to THE GOAT space after each run |
 
 Jira constants in `jira_ticket_creator.py`:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `PROJECT_KEY` | `DIT` | Jira project target |
-| `TITLE_PREFIX` | `[AUTOMATED] - ` | Prefix on ticket titles (remove when out of testing) |
-| `customfield_10083` | Acceptance Criteria | DIT Story custom field (textarea, plain string) |
-| `customfield_10203` | Definition of Done | DIT Story custom field (textarea, plain string) |
-| `customfield_13145` | # of Locations | DIT Story custom field (number — rolling 3-month avg) |
+| `PROJECT_KEY` | `ITDC` | Jira project (Ingestion Templates Data Completeness) |
+| `customfield_10083` | Acceptance Criteria | ITDC Story custom field (textarea) |
+| `customfield_10203` | Definition of Done | ITDC Story custom field (textarea) |
+| `customfield_13486` | Variance | Variance vs 3-month avg (number) |
+| `customfield_13487` | % Ingested | % of locations ingested MTD (number) |
+
+## ITDC Workflow Statuses
+
+| Status | Category | Script behavior |
+|---|---|---|
+| `To Do` | Backlog | New tickets created here; all re-ranked on every run |
+| `In Progress` | Active | Provider skipped — already being worked |
+| `Transferred to DIT` | Active | Provider skipped |
+| `Needs Follow Up` | Active | Provider skipped |
+| `Done` | Complete | Provider skipped for `DC_LOOKBACK_DAYS` after completion date |
+| `Quick Fix Complete` | Complete | Same as Done |
+
+## Backlog Re-ranking
+
+On every run the script fetches all `To Do` tickets and re-ranks them by variance (most negative = highest priority = top of backlog). This requires ITDC to be a Jira Software Scrum or Kanban project with the backlog view and ranking enabled. Re-rank API calls log errors but do not fail the overall run if ranking is unavailable.
+
+Ranking uses `PUT /rest/agile/1.0/issue/rank` in batches of 50, processed lowest-priority-first so the highest-priority batch ends at the very top.
+
+## Pre-flight Checks
+
+Before each run the script validates:
+- `JIRA_API_TOKEN` is set in the environment
+- The data CSV exists at `DATA_FILE_PATH`
+- The CSV contains all required columns
+
+Any pre-flight failure is included in the Google Chat webhook report (if enabled) and causes the script to exit with code 1 without touching Jira.
 
 ## Jira Safety Rules
 
-- **Never delete Jira tickets** or bulk-modify the backlog.
-- **Never create tickets beyond `max_tickets_per_run`** — this cap exists intentionally to prevent flooding the backlog during testing and early rollout. Do not raise it without explicit user instruction.
-- The script deduplicates by checking for open tickets with matching provider ID before creating new ones — preserve this behavior.
-- Providers with an open DC story or a recently completed one (within `dc_lookback_days`) are automatically skipped.
+- **Never delete Jira tickets.**
+- **Never touch tickets outside `To Do` status** — in-progress and completed tickets are read-only.
+- The script deduplicates via a single bulk JQL query for all open and recently-completed ITDC stories before creating any new tickets. Provider ID is extracted from the title format `Provider Name (ID)`.
+- Providers with an open or in-progress ticket are skipped entirely.
+- Providers completed within `DC_LOOKBACK_DAYS` are skipped.
 
 ## Ticket Template
 
-The ticket description (`build_description()`) contains the provider/ID, issue location, and blank placeholders for Issue Description and Example Controls.
+**Title format:** `Provider Name (ProviderID)`
 
-Acceptance Criteria (`build_acceptance_criteria()`) and Definition of Done (`build_definition_of_done()`) are sent to their dedicated Jira custom fields (`customfield_10083` and `customfield_10203` respectively). **Do not modify this wording** without explicit instruction — it represents team process agreements.
+The description (`_build_description()`) shows variance, % ingested, and rolling avg at creation time.
 
-## Runtime State Files
+Acceptance Criteria (`_build_acceptance_criteria()`) and Definition of Done (`_build_definition_of_done()`) are sent to `customfield_10083` and `customfield_10203` respectively. **Do not modify this wording** without explicit instruction — it represents team process agreements.
 
-All three are gitignored.
+## Google Chat Report
 
-| File | Purpose |
-|---|---|
-| `config.json` | Current thresholds. Read at startup; falls back to hardcoded defaults if absent. Edit via `manage.py`. |
-| `runs.jsonl` | Append-only run log. One JSON line per execution: timestamp, file, thresholds, providers evaluated/flagged, tickets created, errors. |
-| `config_changes.jsonl` | Append-only audit trail of threshold changes: timestamp, field, old value, new value, note. |
+When `SEND_GOOGLE_CHAT_REPORT = True`, posts a Card v2 to THE GOAT space containing:
 
-## Future Plans
+1. **New Tickets Created** — tickets opened this run (or "No new tickets created.")
+2. **Top 5 Backlog** — highest-priority `To Do` tickets after re-ranking, with variance and % ingested
+3. **Errors** — pre-flight failures or ticket creation errors (if any)
 
-- Additional Power BI data sources / report types
-- Scheduled execution via GitHub Webhooks
-- Possibly support additional Jira project keys beyond `DIT`
-- Data file freshness check: warn/abort if the variance file is older than expected
+The report is sent even when the run fails early (e.g., data file missing), so errors are always surfaced via the webhook.
+
+## Phase 2 Roadmap
+
+### Scheduled Execution and Alerting
+
+1. **Windows Task Scheduler** — Deploy as a scheduled wrapper on an on-prem server, triggered daily at 9:00 AM (after the 8:30 CSV refresh).
+2. **Secrets in Credential Manager** — Replace the `.env` file with Windows Credential Manager lookups so credentials are not stored in plaintext on disk.
+3. **DataDog monitoring** — Emit a custom metric on each run (tickets created, errors, providers evaluated). Alert on consecutive failures or unexpected zero-coverage days.
+4. **Staleness check** — Abort and alert if the variance CSV has not been updated since the last expected refresh time.
+5. **Remote trigger** — Allow a manual run via a GitHub Actions workflow dispatch or inbound webhook.

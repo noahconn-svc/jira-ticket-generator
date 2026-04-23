@@ -1,12 +1,14 @@
 """
-Jira Ticket Creator for Data Completeness Issues
-Automatically creates Jira tickets based on Power BI variance data.
-Designed for unattended/scheduled execution — no interactive prompts.
+Jira Ticket Creator — RFC 67: ITDC Data Completeness
+Creates and re-ranks ITDC stories for providers with significant variance
+from their 3-month ingestion average.
+
+Run: python jira_ticket_creator.py
 """
 
-import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -17,334 +19,311 @@ from requests.auth import HTTPBasicAuth
 
 load_dotenv()
 
-# Jira / Google Chat credentials
+# ── Credentials ───────────────────────────────────────────────────────────────
 JIRA_URL = "https://conservice.atlassian.net"
 JIRA_EMAIL = "nconn@conservice.com"
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 GOOGLE_CHAT_WEBHOOK = os.getenv("GOOGLE_CHAT_WEBHOOK")
-PROJECT_KEY = "DIT"
-TITLE_PREFIX = "[AUTOMATED] - "
 
-# Column names (matching the Power BI export exactly)
-COL_PROVIDER_NAME = "Abbyy Name"
-COL_PROVIDER_ID = "Abbyy/BC ID"
-COL_PERCENT_INGESTED = "% of Locactions Ingested MTD of Rolling 3 Month Avg"
-COL_VARIANCE = "Current Month Expected Variance (Based on 3 Mos Avg)"
-COL_ROLLING_AVG_LOCATIONS = "Rolling 3 Month Avg # of Locations Ingested"
+# ── Project ───────────────────────────────────────────────────────────────────
+PROJECT_KEY = "ITDC"
 
-# Config defaults — overridden by config.json if present
-_DEFAULTS = {
-    "min_percent_ingested": 0.10,
-    "max_variance": -1000,
-    "max_tickets_per_run": 2,
-    "dc_lookback_days": 30,
-    "send_google_chat_report": False,
+STATUS_BACKLOG       = "To Do"
+STATUSES_IN_PROGRESS = ("In Progress", "Transferred to DIT", "Needs Follow Up")
+STATUSES_DONE        = ("Done", "Quick Fix Complete")
+
+# ── Data source ───────────────────────────────────────────────────────────────
+DATA_FILE_PATH = (
+    r"U:\Departments\Transformation\Ops Reporting Data"
+    r"\Data Completeness Report\Output"
+    r"\Variance in Bills and Locations Ingested by Bill Central.csv"
+)
+
+# ── Thresholds — edit here to change behavior ─────────────────────────────────
+MIN_PERCENT_INGESTED    = 0.10   # Provider must have ingested ≥10% of locations MTD
+MAX_VARIANCE            = -1000  # Variance must be worse than -1,000 vs 3-month avg
+DC_LOOKBACK_DAYS        = 30     # Days after completion before a provider re-enters the backlog
+SEND_GOOGLE_CHAT_REPORT = True
+
+# ── Column mapping ────────────────────────────────────────────────────────────
+_COLUMNS = {
+    "provider_name":    "AbbyyName",
+    "provider_id":      "AbbyyBCID",
+    "percent_ingested": "PercentIngested",
+    "variance":         "CurrentVariance",
 }
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "config.json")
-_RUNS_PATH = os.path.join(_SCRIPT_DIR, "runs.jsonl")
-_LOG_PATH = os.path.join(_SCRIPT_DIR, "jira_ticket_creator.log")
-
-# Logging — file only; no console output
 logging.basicConfig(
-    filename=_LOG_PATH,
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
 
-def load_config():
-    """Load config.json, falling back to defaults for any missing keys."""
-    config = dict(_DEFAULTS)
-    if os.path.exists(_CONFIG_PATH):
-        try:
-            with open(_CONFIG_PATH) as f:
-                config.update(json.load(f))
-        except Exception as e:
-            log.warning("Could not read config.json: %s — using defaults", e)
-    return config
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
 
-
-def find_data_file():
-    """Find the Power BI export file in the project directory."""
-    for f in os.listdir(_SCRIPT_DIR):
-        if f.endswith((".xlsx", ".xls", ".csv")) and "variance" in f.lower():
-            return os.path.join(_SCRIPT_DIR, f)
-    return None
-
-
-def read_power_bi_data(file_path):
-    """Read and parse the Power BI export file."""
-    if file_path.endswith(".csv"):
-        df = pd.read_csv(file_path)
+def preflight_checks():
+    """Validate configuration and data before running. Returns list of error strings."""
+    errors = []
+    if not JIRA_API_TOKEN:
+        errors.append("JIRA_API_TOKEN not set in .env")
+    if not os.path.exists(DATA_FILE_PATH):
+        errors.append(f"Data file not found: {DATA_FILE_PATH}")
     else:
-        df = pd.read_excel(file_path)
-    log.info("Loaded %d providers from: %s", len(df), os.path.basename(file_path))
-    return df
+        try:
+            df_head = pd.read_csv(DATA_FILE_PATH, nrows=0)
+            _detect_columns(df_head)
+        except Exception as e:
+            errors.append(f"Data file column error: {e}")
+    return errors
 
 
-def validate_columns(df):
-    """Raise ValueError if required columns are missing."""
-    required = [
-        COL_PROVIDER_NAME,
-        COL_PROVIDER_ID,
-        COL_PERCENT_INGESTED,
-        COL_VARIANCE,
-        COL_ROLLING_AVG_LOCATIONS,
-    ]
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise ValueError(f"Required columns missing from file: {missing}")
+# ── Data loading ──────────────────────────────────────────────────────────────
+
+def _detect_columns(df):
+    """Map logical column keys to actual DataFrame column names (case-insensitive)."""
+    normalized = {c.strip().lower(): c for c in df.columns}
+    result = {}
+    for key, col in _COLUMNS.items():
+        if col in df.columns:
+            result[key] = col
+        elif col.strip().lower() in normalized:
+            result[key] = normalized[col.strip().lower()]
+        else:
+            raise ValueError(
+                f"Could not find column '{key}' (expected: '{col}'). "
+                f"Available: {list(df.columns)}"
+            )
+    return result
 
 
-def filter_problematic_providers(df, min_percent_ingested, max_variance):
-    """Filter providers meeting criteria for ticket creation."""
-    filtered = df[
-        (df[COL_PERCENT_INGESTED] >= min_percent_ingested)
-        & (df[COL_VARIANCE] < max_variance)
-    ].copy()
-    return filtered.sort_values(COL_VARIANCE).reset_index(drop=True)
+def load_data():
+    """Load the variance CSV and return (df, cols)."""
+    df = pd.read_csv(DATA_FILE_PATH)
+    log.info("Loaded %d providers from data file", len(df))
+    cols = _detect_columns(df)
+    return df, cols
 
 
-def get_jira_auth():
-    """Return reusable auth and headers for Jira API calls."""
-    auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    return auth, headers
+def filter_flagged(df, cols):
+    """Return providers that meet both thresholds, sorted worst variance first."""
+    mask = (
+        (df[cols["percent_ingested"]] >= MIN_PERCENT_INGESTED)
+        & (df[cols["variance"]] < MAX_VARIANCE)
+    )
+    return df[mask].copy().sort_values(cols["variance"]).reset_index(drop=True)
 
 
-def check_related_tickets(provider_name, provider_id, dc_lookback_days):
-    """Check for existing DC tickets for this provider.
+# ── Jira helpers ──────────────────────────────────────────────────────────────
 
-    Returns:
-        {"has_open_dc": bool, "has_recent_dc": bool}
-    """
-    auth, headers = get_jira_auth()
-    pid = int(provider_id)
+def _auth():
+    return HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
 
-    def run_jql(jql, max_results):
+
+def _headers():
+    return {"Accept": "application/json", "Content-Type": "application/json"}
+
+
+def _jql_search(jql, fields, max_results=100):
+    """Run a JQL search and return all matching issues (handles pagination)."""
+    issues = []
+    start = 0
+    while True:
         resp = requests.post(
             f"{JIRA_URL}/rest/api/3/search/jql",
             json={
                 "jql": jql,
-                "fields": ["summary", "status", "resolutiondate"],
+                "fields": fields,
                 "maxResults": max_results,
+                "startAt": start,
             },
-            auth=auth,
-            headers=headers,
+            auth=_auth(),
+            headers=_headers(),
         )
-        return resp.json().get("issues", []) if resp.status_code == 200 else []
-
-    # Query 1: open Data Completeness ticket — hard skip
-    jql_dc = (
-        f'project = {PROJECT_KEY} '
-        f'AND summary ~ "Data Completeness" '
-        f'AND (summary ~ "{pid}" OR summary ~ "{provider_name}") '
-        f'AND statusCategory != Done'
-    )
-    if run_jql(jql_dc, 1):
-        return {"has_open_dc": True, "has_recent_dc": False}
-
-    # Query 1b: recently completed Data Completeness ticket
-    jql_dc_done = (
-        f'project = {PROJECT_KEY} '
-        f'AND summary ~ "Data Completeness" '
-        f'AND (summary ~ "{pid}" OR summary ~ "{provider_name}") '
-        f'AND statusCategory = Done AND updated >= -{dc_lookback_days}d'
-    )
-    dc_done_issues = run_jql(jql_dc_done, 1)
-    return {"has_open_dc": False, "has_recent_dc": bool(dc_done_issues)}
+        if resp.status_code != 200:
+            log.error("JQL search failed (%s): %s", resp.status_code, jql[:120])
+            break
+        data = resp.json()
+        batch = data.get("issues", [])
+        issues.extend(batch)
+        start += len(batch)
+        if start >= data.get("total", 0) or not batch:
+            break
+    return issues
 
 
-def build_description(provider_name, provider_id):
-    """Build the Jira ticket description."""
-    return f"""Provider + ID: {provider_name} - {provider_id}
-Issue found in: Data Completeness Report by automated script
-Issue Description:
+def get_existing_tickets():
+    """Fetch all ITDC stories that are open or recently completed (within lookback window).
 
-Example Controls:
-"""
-
-
-def build_acceptance_criteria():
-    """Return Acceptance Criteria text for customfield_10083."""
-    return (
-        "The requested feature is completely implemented and meets the goal of the story.\n"
-        "  - If no specific feature is requested, there should be an attempt to identify a feature.\n"
-        "  - A backup Comment in Flexilayout is submitted documenting challenge resolved and changes made.\n"
-        "  - Line Item skeletons for those line items related to our template changes, and are necessary for template testing, are set up in Line Item Manager OR contact is made with ops to set these up\n"
-        "  - Measures skeletons for those measures related to our template changes, and are necessary for template testing, are set up in Line Item Manager OR contact is made with ops to set these up\n"
-        "  - InvoiceType and ReadType aliases have been set up.\n"
-        "  - Prohibited element documentation has been entered for any prohibited elements added/removed.\n"
-        "  - A Verification/Setup Station batch has been run using the most recent Flexilayout & Line Item Manager information.\n"
-        "Review Onboarding report for Linking/Validation issues and correct.  These should decrease!\n"
-        "  - A new task is submitted for large fixes necessary\n"
-        "Documentation is added to the Jira task describing changes that were made\n"
-        "Applicable unfixable changes are discussed in appropriate meetings and documented in appropriate trackers (ie, Unresolved Issues doc).\n"
-        "Ensure proper tickets for other projects/teams are submitted."
-    )
-
-
-def build_definition_of_done():
-    """Return Definition of Done text for customfield_10203."""
-    return (
-        "An ABBYY batch containing the specific bills identified and/or random bills from the last 30 days, is run.  "
-        "The batch should contain 90-100 bills with a mixture of example control #'s provided as well as additional, random bills.\n"
-        "  - The size of the ABBYY batch and what types of bills were included should be detailed in the comments on the ticket.\n"
-        "  - Visual confirmation the provider has been classified.\n"
-        "  - Visual confirmation the form has been populated with all applicable data and that the data on the bill matches the data in Verification/Setup Station and appropriate action is taken.\n"
-        "  - All red flags are resolved or documented in Jira task.\n"
-        "  - Prohibited element flags exist on applicable solar, lighting, and summary bills.\n"
-        "Add/update necessary template documentation in Confluence."
-    )
-
-
-def text_to_adf(text):
-    """Convert plain text description to Atlassian Document Format (ADF).
-    Handles *bold* markers and bullet points (* prefix).
+    Returns dict: str(provider_id) -> {"key": str, "status": str}
+    Provider ID is parsed from the title format: "Provider Name (12345)"
     """
-    lines = text.split("\n")
-    content = []
-    bullet_items = []
-
-    def flush_bullets():
-        if bullet_items:
-            content.append({"type": "bulletList", "content": list(bullet_items)})
-            bullet_items.clear()
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("* "):
-            flush_bullets()
-            bullet_items.append({
-                "type": "listItem",
-                "content": [{"type": "paragraph", "content": parse_inline(stripped[2:])}],
-            })
-        elif len(stripped) > 2 and line.startswith("   * "):
-            indent_text = stripped.lstrip("* ").strip()
-            if bullet_items:
-                last = bullet_items[-1]
-                sub_list = next((n for n in last["content"] if n["type"] == "bulletList"), None)
-                if not sub_list:
-                    sub_list = {"type": "bulletList", "content": []}
-                    last["content"].append(sub_list)
-                sub_list["content"].append({
-                    "type": "listItem",
-                    "content": [{"type": "paragraph", "content": parse_inline(indent_text)}],
-                })
-            else:
-                bullet_items.append({
-                    "type": "listItem",
-                    "content": [{"type": "paragraph", "content": parse_inline(indent_text)}],
-                })
-        elif stripped == "":
-            flush_bullets()
-        else:
-            flush_bullets()
-            content.append({"type": "paragraph", "content": parse_inline(stripped)})
-
-    flush_bullets()
-    return {"version": 1, "type": "doc", "content": content}
+    done_statuses = ', '.join(f'"{s}"' for s in STATUSES_DONE)
+    jql = (
+        f'project = {PROJECT_KEY} AND issuetype = Story '
+        f'AND (status not in ({done_statuses}) OR updated >= -{DC_LOOKBACK_DAYS}d)'
+    )
+    issues = _jql_search(jql, ["summary", "status"])
+    result = {}
+    for issue in issues:
+        m = re.search(r'\((\d+)\)\s*$', issue["fields"]["summary"])
+        if m:
+            pid = m.group(1)
+            result[pid] = {
+                "key": issue["key"],
+                "status": issue["fields"]["status"]["name"],
+            }
+    log.info("Found %d relevant existing ITDC stories", len(result))
+    return result
 
 
-def parse_inline(text):
-    """Parse inline *bold* markers into ADF text nodes."""
-    import re
-    parts = re.split(r'(\*[^*]+\*)', text)
-    nodes = []
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith("*") and part.endswith("*") and len(part) > 2:
-            nodes.append({"type": "text", "text": part[1:-1], "marks": [{"type": "strong"}]})
-        else:
-            nodes.append({"type": "text", "text": part})
-    return nodes if nodes else [{"type": "text", "text": " "}]
-
-
-def plain_text_to_adf(text):
-    """Wrap plain multi-line text as ADF paragraphs (for textarea custom fields)."""
-    content = [
-        {"type": "paragraph", "content": [{"type": "text", "text": line}]}
-        for line in text.split("\n")
-        if line.strip()
-    ]
-    if not content:
-        content = [{"type": "paragraph", "content": [{"type": "text", "text": " "}]}]
-    return {"version": 1, "type": "doc", "content": content}
-
-
-def create_jira_ticket(provider_name, provider_id, rolling_avg_locations):
-    """Create a single Jira ticket for a provider. Returns the ticket key or None."""
-    title = f"{TITLE_PREFIX}Data Completeness - {provider_name} - {int(provider_id)}"
+def create_jira_ticket(name, provider_id, variance, pct_ingested):
+    """Create a single ITDC story. Returns the ticket key or None on failure."""
+    title = f"{name} ({int(provider_id)})"
     payload = {
         "fields": {
             "project": {"key": PROJECT_KEY},
             "summary": title,
-            "description": text_to_adf(build_description(provider_name, provider_id)),
             "issuetype": {"name": "Story"},
-            "customfield_10083": plain_text_to_adf(build_acceptance_criteria()),
-            "customfield_10203": plain_text_to_adf(build_definition_of_done()),
-            "customfield_13145": float(rolling_avg_locations),
+            "customfield_13486": variance,
+            "customfield_13487": pct_ingested,
         }
     }
-    auth, headers = get_jira_auth()
-    response = requests.post(f"{JIRA_URL}/rest/api/3/issue", json=payload, auth=auth, headers=headers)
-    if response.status_code == 201:
-        key = response.json()["key"]
-        log.info("Created %s: %s", key, title)
+    resp = requests.post(
+        f"{JIRA_URL}/rest/api/3/issue",
+        json=payload,
+        auth=_auth(),
+        headers=_headers(),
+    )
+    if resp.status_code == 201:
+        key = resp.json()["key"]
+        log.info("Created %s: %s (variance=%s)", key, title, f"{variance:,.0f}")
         return key
-    else:
-        log.error("Failed to create ticket for %s: %s %s", provider_name, response.status_code, response.text[:200])
-        return None
+    log.error(
+        "Failed to create ticket for %s: %s %s",
+        name, resp.status_code, resp.text[:300],
+    )
+    return None
 
 
-def send_google_chat_report(created_tickets, errors):
-    """POST a Google Chat Card v2 summary of created tickets to THE GOAT space.
+# ── Backlog re-ranking ────────────────────────────────────────────────────────
 
-    Args:
-        created_tickets: list of dicts with keys: key, name, variance, pct_ingested
-        errors: list of error strings
+def rerank_backlog(variance_by_id):
+    """Re-rank all ITDC To Do tickets by variance (worst first = top of backlog).
+
+    variance_by_id: dict mapping str(provider_id) -> float variance
+
+    Processes batches of 50 from lowest-priority to highest-priority, each ranked
+    before the first issue of the previous batch, so the highest-priority batch
+    ends at the top.
+
+    Returns list of (key, provider_id_or_None) in ranked order (index 0 = top).
+    """
+    issues = _jql_search(
+        f'project = {PROJECT_KEY} AND issuetype = Story AND status = "{STATUS_BACKLOG}"',
+        ["summary"],
+    )
+    if not issues:
+        log.info("No backlog tickets to re-rank")
+        return []
+
+    def _variance_for(issue):
+        m = re.search(r'\((\d+)\)\s*$', issue["fields"]["summary"])
+        if m:
+            return variance_by_id.get(m.group(1), 0)
+        return 0  # tickets without parseable ID go to bottom
+
+    sorted_issues = sorted(issues, key=_variance_for)  # ascending: most negative first
+    sorted_keys = [i["key"] for i in sorted_issues]
+    sorted_pids = []
+    for issue in sorted_issues:
+        m = re.search(r'\((\d+)\)\s*$', issue["fields"]["summary"])
+        sorted_pids.append(m.group(1) if m else None)
+
+    log.info("Re-ranking %d backlog tickets", len(sorted_keys))
+
+    BATCH = 50
+    prev_batch_first = None
+    for i in range(len(sorted_keys) - 1, -1, -BATCH):
+        batch = sorted_keys[max(0, i - BATCH + 1):i + 1]
+        body = {"issues": batch}
+        if prev_batch_first is not None:
+            body["rankBeforeIssue"] = prev_batch_first
+
+        resp = requests.put(
+            f"{JIRA_URL}/rest/agile/1.0/issue/rank",
+            json=body,
+            auth=_auth(),
+            headers=_headers(),
+        )
+        if resp.status_code in (200, 204):
+            prev_batch_first = batch[0]
+        else:
+            log.error("Re-rank batch failed (%s): %s", resp.status_code, resp.text[:300])
+            break
+
+    return list(zip(sorted_keys, sorted_pids))
+
+
+# ── Google Chat report ────────────────────────────────────────────────────────
+
+def send_google_chat_report(created_tickets, top5_backlog, errors):
+    """POST a Google Chat Card v2 to THE GOAT space.
+
+    created_tickets: list of {key, name, variance, pct_ingested}
+    top5_backlog:    list of {key, name, variance, pct_ingested}
+    errors:          list of str
     """
     if not GOOGLE_CHAT_WEBHOOK:
-        log.error("send_google_chat_report: GOOGLE_CHAT_WEBHOOK not set in .env")
+        log.error("GOOGLE_CHAT_WEBHOOK not set in .env")
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
     n = len(created_tickets)
     e = len(errors)
 
-    # Section 1: Tickets Created
-    if created_tickets:
-        ticket_widgets = []
-        for t in created_tickets:
-            ticket_widgets.append({"decoratedText": {
-                "topLabel": t["name"],
-                "text": f"Variance: {t['variance']:,.0f} · {t['pct_ingested']:.1%} ingested",
-                "button": {
-                    "text": t["key"],
-                    "onClick": {"openLink": {"url": f"https://conservice.atlassian.net/browse/{t['key']}"}},
-                },
-            }})
-    else:
-        ticket_widgets = [{"textParagraph": {"text": "No tickets created."}}]
+    def _ticket_widget(t):
+        return {"decoratedText": {
+            "topLabel": t["name"],
+            "text": f"Variance: {t['variance']:,.0f} · {t['pct_ingested']:.1%} ingested",
+            "button": {
+                "text": t["key"],
+                "onClick": {"openLink": {"url": f"{JIRA_URL}/browse/{t['key']}"}},
+            },
+        }}
 
-    sections = [{"header": "Tickets Created", "widgets": ticket_widgets}]
+    sections = []
 
-    # Section 2: Errors (only if present)
+    sections.append({
+        "header": "New Tickets Created",
+        "widgets": (
+            [_ticket_widget(t) for t in created_tickets]
+            if created_tickets
+            else [{"textParagraph": {"text": "No new tickets created."}}]
+        ),
+    })
+
+    if top5_backlog:
+        sections.append({
+            "header": "Top 5 Backlog",
+            "widgets": [_ticket_widget(t) for t in top5_backlog],
+        })
+
     if errors:
         sections.append({
             "header": "Errors",
             "widgets": [{"textParagraph": {"text": err}} for err in errors],
         })
 
-    payload = {"cardsV2": [{"cardId": "jira-ticket-report", "card": {
+    payload = {"cardsV2": [{"cardId": "itdc-dc-report", "card": {
         "header": {
-            "title": "Jira Ticket Report",
-            "subtitle": f"{today} · {n} created, {e} error{'s' if e != 1 else ''}",
+            "title": "ITDC Data Completeness Report",
+            "subtitle": (
+                f"{today} · {n} new ticket{'s' if n != 1 else ''}"
+                f", {e} error{'s' if e != 1 else ''}"
+            ),
             "imageType": "CIRCLE",
             "imageUrl": "https://fonts.gstatic.com/s/i/googlematerialicons/assignment/v6/white-48dp.png",
         },
@@ -358,138 +337,108 @@ def send_google_chat_report(created_tickets, errors):
         log.error("Google Chat report failed: %s %s", resp.status_code, resp.text[:300])
 
 
-def _append_run_log(entry):
-    with open(_RUNS_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
-
-def _git_push_run_log():
-    import subprocess
-    for cmd in [
-        ["git", "add", "runs.jsonl"],
-        ["git", "commit", "-m", f"runs: {datetime.now().strftime('%Y-%m-%d %H:%M')}"],
-        ["git", "push"],
-    ]:
-        result = subprocess.run(cmd, cwd=_SCRIPT_DIR, capture_output=True, text=True)
-        if result.returncode != 0:
-            if "nothing to commit" in result.stdout + result.stderr:
-                return
-            log.warning("git push failed for runs.jsonl: %s", result.stderr.strip() or result.stdout.strip())
-            return
-
-
-def run(file_path=None):
-    """Execute the full ticket-creation pipeline.
-
-    Returns a result dict with run summary.
-    Raises RuntimeError on configuration or data errors.
-    """
-    config = load_config()
-    min_percent_ingested = config["min_percent_ingested"]
-    max_variance = config["max_variance"]
-    max_tickets_per_run = config["max_tickets_per_run"]
-    dc_lookback_days = config["dc_lookback_days"]
-    send_report = config["send_google_chat_report"]
-
+def run():
+    """Execute the full pipeline. Returns dict with created_ticket_data, top5_backlog, errors."""
     log.info(
-        "Run started — min_pct=%.0f%%, max_var=%s, max_tickets=%d, lookback=%dd",
-        min_percent_ingested * 100, max_variance, max_tickets_per_run, dc_lookback_days,
+        "Run started — project=%s, min_pct=%.0f%%, max_var=%s, lookback=%dd",
+        PROJECT_KEY, MIN_PERCENT_INGESTED * 100, MAX_VARIANCE, DC_LOOKBACK_DAYS,
     )
 
     errors = []
-    run_entry = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "file": None,
-        "thresholds": {
-            "min_percent_ingested": min_percent_ingested,
-            "max_variance": max_variance,
-            "max_tickets_per_run": max_tickets_per_run,
-            "dc_lookback_days": dc_lookback_days,
-        },
-        "providers_evaluated": 0,
-        "providers_flagged": 0,
-        "tickets_created": [],
-        "tickets_skipped": 0,
+    df, cols = load_data()
+    flagged = filter_flagged(df, cols)
+    log.info("%d of %d providers flagged", len(flagged), len(df))
+
+    # Build provider lookup for re-ranking and report enrichment
+    provider_info = {}
+    for _, row in df.iterrows():
+        if pd.notna(row[cols["provider_id"]]):
+            try:
+                pid = str(int(row[cols["provider_id"]]))
+                provider_info[pid] = {
+                    "name": row[cols["provider_name"]],
+                    "variance": float(row[cols["variance"]]),
+                    "pct_ingested": float(row[cols["percent_ingested"]]),
+                }
+            except (ValueError, TypeError):
+                pass
+    variance_by_id = {pid: info["variance"] for pid, info in provider_info.items()}
+
+    existing = get_existing_tickets()
+
+    created_ticket_data = []
+    tickets_skipped = 0
+    for _, row in flagged.iterrows():
+        try:
+            pid = str(int(row[cols["provider_id"]]))
+        except (ValueError, TypeError):
+            log.warning("Skipping row with invalid provider_id: %s", row[cols["provider_id"]])
+            continue
+
+        if pid in existing:
+            tickets_skipped += 1
+            log.debug(
+                "Skip %s (%s) — existing ticket %s (%s)",
+                row[cols["provider_name"]], pid,
+                existing[pid]["key"], existing[pid]["status"],
+            )
+            continue
+
+        key = create_jira_ticket(
+            row[cols["provider_name"]],
+            row[cols["provider_id"]],
+            float(row[cols["variance"]]),
+            float(row[cols["percent_ingested"]]),
+        )
+        if key:
+            created_ticket_data.append({
+                "key": key,
+                "name": row[cols["provider_name"]],
+                "variance": float(row[cols["variance"]]),
+                "pct_ingested": float(row[cols["percent_ingested"]]),
+            })
+        else:
+            errors.append(f"Failed to create ticket for {row[cols['provider_name']]} ({pid})")
+
+    log.info("Created %d ticket(s), skipped %d", len(created_ticket_data), tickets_skipped)
+
+    ranked = rerank_backlog(variance_by_id)
+
+    top5_backlog = []
+    for key, pid in ranked[:5]:
+        info = provider_info.get(pid) if pid else None
+        if info:
+            top5_backlog.append({"key": key, **info})
+
+    return {
+        "created_ticket_data": created_ticket_data,
+        "top5_backlog": top5_backlog,
         "errors": errors,
     }
 
-    if not JIRA_API_TOKEN:
-        raise RuntimeError("JIRA_API_TOKEN not set in environment")
-
-    if not file_path:
-        file_path = find_data_file()
-    if not file_path or not os.path.exists(file_path):
-        raise RuntimeError(f"No variance file found: {file_path!r}")
-
-    run_entry["file"] = os.path.basename(file_path)
-
-    df = read_power_bi_data(file_path)
-    validate_columns(df)
-    run_entry["providers_evaluated"] = len(df)
-
-    flagged = filter_problematic_providers(df, min_percent_ingested, max_variance)
-    run_entry["providers_flagged"] = len(flagged)
-    log.info("%d of %d providers flagged", len(flagged), len(df))
-
-    if len(flagged) == 0:
-        log.info("No providers meet ticket-creation criteria. Run complete.")
-        _append_run_log(run_entry)
-        return run_entry
-
-    # Enrich with existing ticket data
-    log.info("Checking for existing tickets (%d providers)...", len(flagged))
-    enriched = []
-    for _, row in flagged.iterrows():
-        result = check_related_tickets(row[COL_PROVIDER_NAME], row[COL_PROVIDER_ID], dc_lookback_days)
-        row = row.copy()
-        row["_has_open_dc"]   = result["has_open_dc"]
-        row["_has_recent_dc"] = result["has_recent_dc"]
-        enriched.append(row)
-    flagged = pd.DataFrame(enriched)
-
-    # Auto-select: skip providers with open DC or recently completed DC story
-    def is_eligible(row):
-        return not row.get("_has_open_dc", False) and not row.get("_has_recent_dc", False)
-
-    eligible = flagged[flagged.apply(is_eligible, axis=1)].head(max_tickets_per_run)
-    skipped = len(flagged) - len(eligible)
-    run_entry["tickets_skipped"] = skipped
-    log.info("%d eligible, %d skipped (existing stories)", len(eligible), skipped)
-
-    # Create tickets
-    created = []
-    created_tickets = []
-    for _, row in eligible.iterrows():
-        key = create_jira_ticket(row[COL_PROVIDER_NAME], row[COL_PROVIDER_ID], row[COL_ROLLING_AVG_LOCATIONS])
-        if key:
-            created.append(key)
-            created_tickets.append({
-                "key": key,
-                "name": row[COL_PROVIDER_NAME],
-                "variance": row[COL_VARIANCE],
-                "pct_ingested": row[COL_PERCENT_INGESTED],
-            })
-        else:
-            errors.append(f"Failed to create ticket for {row[COL_PROVIDER_NAME]}")
-
-    run_entry["tickets_created"] = created
-    log.info("Run complete — created %d ticket(s): %s", len(created), created or "none")
-    _append_run_log(run_entry)
-    _git_push_run_log()
-
-    if send_report:
-        send_google_chat_report(created_tickets, errors)
-
-    return run_entry
-
 
 def main():
+    created_ticket_data = []
+    top5_backlog = []
+    errors = []
+
     try:
-        run()
-        sys.exit(0)
+        errors = preflight_checks()
+        if not errors:
+            result = run()
+            created_ticket_data = result["created_ticket_data"]
+            top5_backlog = result["top5_backlog"]
+            errors = result["errors"]
     except Exception as e:
         log.exception("Fatal error: %s", e)
-        sys.exit(1)
+        errors.append(f"Fatal error: {e}")
+
+    if SEND_GOOGLE_CHAT_REPORT:
+        send_google_chat_report(created_ticket_data, top5_backlog, errors)
+
+    sys.exit(1 if errors else 0)
 
 
 if __name__ == "__main__":
