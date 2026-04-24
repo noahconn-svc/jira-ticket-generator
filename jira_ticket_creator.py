@@ -40,8 +40,8 @@ DATA_FILE_PATH = (
 )
 
 # ── Thresholds — edit here to change behavior ─────────────────────────────────
-MIN_PERCENT_INGESTED    = 0.10   # Provider must have ingested ≥10% of locations MTD
-MAX_VARIANCE            = -1000  # Variance must be worse than -1,000 vs 3-month avg
+MIN_PERCENT_INGESTED    = 0.10   # Provider must have ingested ≥ this % of locations MTD
+MAX_VARIANCE            = -1500  # Variance must be worse than this value vs 3-month avg
 DC_LOOKBACK_DAYS        = 30     # Days after completion before a provider re-enters the backlog
 SEND_GOOGLE_CHAT_REPORT = True
 
@@ -129,27 +129,27 @@ def _headers():
 def _jql_search(jql, fields, max_results=100):
     """Run a JQL search and return all matching issues (handles pagination)."""
     issues = []
-    start = 0
+    next_page_token = None
     while True:
+        body = {"jql": jql, "fields": fields, "maxResults": max_results}
+        if next_page_token:
+            body["nextPageToken"] = next_page_token
         resp = requests.post(
             f"{JIRA_URL}/rest/api/3/search/jql",
-            json={
-                "jql": jql,
-                "fields": fields,
-                "maxResults": max_results,
-                "startAt": start,
-            },
+            json=body,
             auth=_auth(),
             headers=_headers(),
         )
         if resp.status_code != 200:
-            log.error("JQL search failed (%s): %s", resp.status_code, jql[:120])
+            log.error("JQL search failed (%s): %s | response: %s", resp.status_code, jql[:120], resp.text[:300])
             break
         data = resp.json()
         batch = data.get("issues", [])
         issues.extend(batch)
-        start += len(batch)
-        if start >= data.get("total", 0) or not batch:
+        if data.get("isLast", True) or not batch:
+            break
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
             break
     return issues
 
@@ -163,7 +163,7 @@ def get_existing_tickets():
     done_statuses = ', '.join(f'"{s}"' for s in STATUSES_DONE)
     jql = (
         f'project = {PROJECT_KEY} AND issuetype = Story '
-        f'AND (status not in ({done_statuses}) OR updated >= -{DC_LOOKBACK_DAYS}d)'
+        f'AND (status not in ({done_statuses}) OR updated >= "-{DC_LOOKBACK_DAYS}d")'
     )
     issues = _jql_search(jql, ["summary", "status"])
     result = {}
@@ -177,6 +177,21 @@ def get_existing_tickets():
             }
     log.info("Found %d relevant existing ITDC stories", len(result))
     return result
+
+
+def update_jira_ticket(key, variance, pct_ingested):
+    """Update variance and % ingested fields on an existing ITDC story."""
+    resp = requests.put(
+        f"{JIRA_URL}/rest/api/3/issue/{key}",
+        json={"fields": {"customfield_13486": variance, "customfield_13487": pct_ingested}},
+        auth=_auth(),
+        headers=_headers(),
+    )
+    if resp.status_code == 204:
+        log.info("Updated %s (variance=%s)", key, f"{variance:,.0f}")
+        return True
+    log.error("Failed to update %s: %s %s", key, resp.status_code, resp.text[:300])
+    return False
 
 
 def create_jira_ticket(name, provider_id, variance, pct_ingested):
@@ -248,9 +263,13 @@ def rerank_backlog(variance_by_id):
     prev_batch_first = None
     for i in range(len(sorted_keys) - 1, -1, -BATCH):
         batch = sorted_keys[max(0, i - BATCH + 1):i + 1]
-        body = {"issues": batch}
-        if prev_batch_first is not None:
-            body["rankBeforeIssue"] = prev_batch_first
+        if prev_batch_first is None:
+            if len(batch) == 1:
+                prev_batch_first = batch[0]
+                continue
+            body = {"issues": batch[:-1], "rankBeforeIssue": batch[-1]}
+        else:
+            body = {"issues": batch, "rankBeforeIssue": prev_batch_first}
 
         resp = requests.put(
             f"{JIRA_URL}/rest/agile/1.0/issue/rank",
@@ -370,6 +389,7 @@ def run():
 
     created_ticket_data = []
     tickets_skipped = 0
+    tickets_updated = 0
     for _, row in flagged.iterrows():
         try:
             pid = str(int(row[cols["provider_id"]]))
@@ -378,12 +398,19 @@ def run():
             continue
 
         if pid in existing:
-            tickets_skipped += 1
-            log.debug(
-                "Skip %s (%s) — existing ticket %s (%s)",
-                row[cols["provider_name"]], pid,
-                existing[pid]["key"], existing[pid]["status"],
-            )
+            entry = existing[pid]
+            if entry["status"] == STATUS_BACKLOG:
+                if update_jira_ticket(entry["key"], float(row[cols["variance"]]), float(row[cols["percent_ingested"]])):
+                    tickets_updated += 1
+                else:
+                    errors.append(f"Failed to update ticket {entry['key']} for {row[cols['provider_name']]} ({pid})")
+            else:
+                tickets_skipped += 1
+                log.debug(
+                    "Skip %s (%s) — existing ticket %s (%s)",
+                    row[cols["provider_name"]], pid,
+                    entry["key"], entry["status"],
+                )
             continue
 
         key = create_jira_ticket(
@@ -402,7 +429,7 @@ def run():
         else:
             errors.append(f"Failed to create ticket for {row[cols['provider_name']]} ({pid})")
 
-    log.info("Created %d ticket(s), skipped %d", len(created_ticket_data), tickets_skipped)
+    log.info("Created %d ticket(s), updated %d, skipped %d", len(created_ticket_data), tickets_updated, tickets_skipped)
 
     ranked = rerank_backlog(variance_by_id)
 
