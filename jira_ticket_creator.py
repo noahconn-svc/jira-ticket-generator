@@ -41,7 +41,7 @@ DATA_FILE_PATH = (
 
 # ── Thresholds — edit here to change behavior ─────────────────────────────────
 MIN_PERCENT_INGESTED    = 0.10   # Provider must have ingested ≥ this % of locations MTD
-MAX_VARIANCE            = -1500  # Variance must be worse than this value vs 3-month avg
+MAX_VARIANCE            = -150  # Variance must be worse than this value vs 3-month avg
 DC_LOOKBACK_DAYS        = 30     # Days after completion before a provider re-enters the backlog
 SEND_GOOGLE_CHAT_REPORT = True
 

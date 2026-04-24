@@ -35,13 +35,12 @@ The variance CSV is auto-updated each morning at 8:30 from Power BI at:
 U:\Departments\Transformation\Ops Reporting Data\Data Completeness Report\Output\Variance in Bills and Locations Ingested by Bill Central.csv
 ```
 
-Flexible column detection handles minor renames and the known `Locactions` → `Locations` typo. Required logical columns:
+Required logical columns:
 
-- Provider name (`Abbyy Name`)
-- Provider ID (`Abbyy/BC ID`)
-- % of Locations Ingested MTD vs 3-Month Avg
-- Current Month Expected Variance (vs 3-Month Avg)
-- Rolling 3-Month Avg # of Locations Ingested
+- Provider name (`AbbyyName`)
+- Provider ID (`AbbyyBCID`)
+- % of Locations Ingested MTD vs 3-Month Avg (`PercentIngested`)
+- Current Month Expected Variance (vs 3-Month Avg) (`CurrentVariance"`)
 
 ## Key Configuration
 
@@ -115,6 +114,25 @@ When `SEND_GOOGLE_CHAT_REPORT = True`, posts a Card v2 to THE GOAT space contain
 3. **Errors** — pre-flight failures or ticket creation errors (if any)
 
 The report is sent even when the run fails early (e.g., data file missing), so errors are always surfaced via the webhook.
+
+## Tests
+
+Run with:
+
+```bash
+python -m pytest tests/ -v
+```
+
+No credentials, network access, or the CSV file are required — all external calls are mocked.
+
+| File | What it covers |
+|---|---|
+| `tests/test_column_detection.py` | `_detect_columns()` — exact match, case-insensitive match, padded whitespace, missing column raises `ValueError` |
+| `tests/test_filtering.py` | `filter_flagged()` — threshold logic for `MIN_PERCENT_INGESTED` and `MAX_VARIANCE`, boundary values (strict vs. non-strict), sort order |
+| `tests/test_deduplication.py` | `run()` routing — new providers create tickets, `To Do` providers update not recreate, all active statuses skip, NaN provider ID skipped, create failure appends to errors |
+| `tests/test_ranking.py` | Provider ID regex edge cases; `rerank_backlog()` ordering (worst variance first), single-issue no-op, empty backlog |
+
+When changing threshold constants or adding new `STATUSES_IN_PROGRESS`/`STATUSES_DONE` entries, update `test_filtering.py` and `test_deduplication.py` accordingly.
 
 ## Phase 2 Roadmap
 
